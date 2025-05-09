@@ -1,0 +1,654 @@
+import openai
+import time
+import os
+import hashlib
+import json
+import sys  # For stderr
+
+# import requests # Future: for sending data to collector
+from functools import wraps
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Optional,
+    Tuple,
+    Type,
+    Coroutine,
+    Iterator,
+    AsyncIterator,
+)
+
+# Module-level configuration and state
+_original_methods: Dict[str, Callable[..., Any]] = {}
+_app_name: str = "default_app"
+_wiretapp_endpoint: str = os.getenv("WIRETAPP_ENDPOINT", "http://localhost:8000/events")
+_include_content: bool = os.getenv("WIRETAPP_INCLUDE_CONTENT", "0") == "1"
+
+
+# Helper to access nested attributes safely
+def _safe_getattr(obj: Any, attrs: str, default: Any = None) -> Any:
+    for attr in attrs.split("."):
+        if hasattr(obj, attr):
+            obj = getattr(obj, attr)
+        else:
+            return default
+    return obj
+
+
+def _hash_identifier(identifier: Optional[str]) -> Optional[str]:
+    """
+    Hashes an identifier using SHA-256 if it's provided.
+
+    Args:
+        identifier: The string to hash.
+
+    Returns:
+        The hex digest of the hash, or None if the input is None.
+    """
+    if identifier is None:
+        return None
+    return hashlib.sha256(identifier.encode("utf-8")).hexdigest()
+
+
+def _send_telemetry(data: Dict[str, Any]) -> None:
+    """
+    Sends telemetry data to the configured endpoint.
+    For now, it prints the data. In the future, it will make an HTTP POST request.
+
+    Args:
+        data: The dictionary of telemetry data to send.
+    """
+    # In a real scenario, consider logging to stderr for errors or using a robust logging library
+    print(f"WIRETAPP_TELEMETRY: {json.dumps(data)}")
+    # Future implementation:
+    # try:
+    #     # Ensure requests is added to dependencies if/when this is uncommented
+    #     import requests
+    #     response = requests.post(_wiretapp_endpoint, json=data, timeout=5)
+    #     response.raise_for_status()
+    # except requests.RequestException as e:
+    #     print(f"Wiretapp Error: Failed to send telemetry - {e}", file=sys.stderr)
+    # except ImportError:
+    #     print("Wiretapp Error: 'requests' library is not installed. Cannot send telemetry.", file=sys.stderr)
+
+
+def _extract_call_details(method_name: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extracts common details from the OpenAI call arguments for SDK v1.x.
+    """
+    details: Dict[str, Any] = {
+        "model_name": kwargs.get("model"),
+        # For OpenAI SDK v1.x, 'user' is a valid parameter in chat/completions.create
+        "user_id_hashed": _hash_identifier(kwargs.get("user")),
+        # 'session_id' is not standard; include if users pass it via extra_body or similar
+        "session_id_hashed": _hash_identifier(kwargs.get("session_id")),
+    }
+
+    if _include_content:
+        # Method names like "ChatCompletions.create", "Embeddings.create"
+        if "ChatCompletions" in method_name:  # Covers sync and async
+            details["prompt_messages"] = kwargs.get("messages")
+        elif (
+            "Completions" in method_name and "Chat" not in method_name
+        ):  # Legacy completions
+            details["prompt_text"] = kwargs.get("prompt")
+        elif "Embeddings" in method_name:
+            details["input_text"] = kwargs.get("input")
+    return details
+
+
+def _extract_response_details(
+    method_name: str, response: Any, is_stream_response: bool = False
+) -> Dict[str, Any]:
+    """
+    Extracts details from the OpenAI API response for SDK v1.x.
+    For streams, `response` is the final response object after stream consumption (e.g., stream.response).
+    """
+    details: Dict[str, Any] = {}
+
+    # Usage is the primary thing to get from the final stream response or non-stream response
+    if hasattr(response, "usage") and response.usage:
+        if hasattr(response.usage, "prompt_tokens"):
+            details["token_usage_prompt"] = response.usage.prompt_tokens
+        if hasattr(response.usage, "completion_tokens"):
+            details["token_usage_completion"] = response.usage.completion_tokens
+        if hasattr(response.usage, "total_tokens"):
+            details["token_usage_total"] = response.usage.total_tokens
+
+    # For non-streaming, and if content is included, extract full completion messages/text.
+    # For streaming, this part is handled by _StreamAccumulator for content.
+    if not is_stream_response and _include_content:
+        if hasattr(response, "choices") and response.choices:
+            try:
+                first_choice = response.choices[0]
+                if "ChatCompletions" in method_name:
+                    if hasattr(first_choice, "message") and first_choice.message:
+                        if hasattr(first_choice.message, "model_dump"):
+                            details["completion_message_full"] = (
+                                first_choice.message.model_dump()
+                            )
+                        else:
+                            details["completion_message_full"] = {
+                                "role": _safe_getattr(first_choice.message, "role"),
+                                "content": _safe_getattr(
+                                    first_choice.message, "content"
+                                ),
+                            }
+                elif "Completions" in method_name and "Chat" not in method_name:
+                    if hasattr(first_choice, "text"):
+                        details["completion_text_full"] = first_choice.text
+            except (AttributeError, IndexError):
+                pass  # Or log a warning
+    return details
+
+
+class _StreamAccumulator:
+    """Helper to accumulate data from OpenAI stream chunks."""
+
+    def __init__(self, method_name: str, include_content: bool):
+        self.method_name = method_name
+        self.include_content = include_content
+        self.accumulated_content: list[str] = []
+        self.full_completion_deltas: list[
+            Dict[str, Any]
+        ] = []  # For chat, if needed for structured reconstruction
+        self.role: Optional[str] = None
+
+    def process_chunk(self, chunk: Any) -> None:
+        """Processes a single chunk from an OpenAI stream."""
+        if not self.include_content:
+            return
+
+        if not hasattr(chunk, "choices") or not chunk.choices:
+            return
+
+        try:
+            delta = chunk.choices[0].delta
+            if delta:
+                if hasattr(delta, "role") and delta.role is not None:
+                    self.role = delta.role  # Capture role if present
+
+                content_piece = _safe_getattr(delta, "content")
+                if content_piece:
+                    self.accumulated_content.append(content_piece)
+
+                # For more structured accumulation if needed (e.g. tool calls in delta)
+                # This part can be expanded based on specific needs for streamed content structure
+                if hasattr(delta, "model_dump"):
+                    self.full_completion_deltas.append(
+                        delta.model_dump(exclude_unset=True)
+                    )
+                elif (
+                    delta.content is not None or delta.role is not None
+                ):  # basic content
+                    self.full_completion_deltas.append(
+                        {"role": delta.role, "content": delta.content}
+                    )
+
+        except (AttributeError, IndexError):
+            # Chunk structure might vary or be empty
+            pass
+
+    def get_accumulated_content_details(self) -> Dict[str, Any]:
+        """Returns a dictionary with the accumulated content from the stream."""
+        if not self.include_content or not self.accumulated_content:
+            return {}
+
+        details: Dict[str, Any] = {}
+        joined_content = "".join(self.accumulated_content)
+
+        if "ChatCompletions" in self.method_name:
+            # For chat, it's common to provide the full message object if possible
+            # Reconstructing the exact message structure from deltas can be complex,
+            # especially with tool calls. For now, we send aggregated text content.
+            # And the list of deltas for more detailed inspection if needed.
+            details["completion_content_streamed"] = joined_content
+            final_message_guess = {
+                "role": self.role or "assistant",
+                "content": joined_content,
+            }
+            details["completion_message_streamed_aggregated"] = final_message_guess
+            # details["completion_deltas_streamed"] = self.full_completion_deltas # Optional: for very detailed logging
+
+        elif "Completions" in self.method_name and "Chat" not in self.method_name:
+            details["completion_text_streamed"] = joined_content
+
+        return details
+
+
+def _wrap_sync_stream(
+    original_stream: Iterator[Any], telemetry_payload: Dict[str, Any], method_name: str
+) -> Iterator[Any]:
+    """Wraps a synchronous stream iterator to capture telemetry."""
+    stream_start_time_s = telemetry_payload[
+        "timestamp_client_call_utc"
+    ]  # Start time of the initial API call
+    accumulator = _StreamAccumulator(method_name, _include_content)
+    error_info_stream: Optional[Dict[str, Any]] = None
+    status_code_stream: int = 200  # Assume success unless error during stream
+
+    try:
+        for chunk in original_stream:
+            accumulator.process_chunk(chunk)
+            yield chunk
+    except openai.APIStatusError as e:
+        status_code_stream = e.status_code
+        error_info_stream = {
+            "error_type": type(e).__name__,
+            "error_message": str(_safe_getattr(e, "message", str(e))),
+            "error_code": _safe_getattr(e, "code"),
+            "error_param": _safe_getattr(e, "param"),
+        }
+        raise  # Re-raise to propagate to user
+    except Exception as e:
+        status_code_stream = 500
+        error_info_stream = {"error_type": type(e).__name__, "error_message": str(e)}
+        raise  # Re-raise
+    finally:
+        telemetry_payload.update(accumulator.get_accumulated_content_details())
+
+        final_response_obj = _safe_getattr(original_stream, "response")
+        if final_response_obj:
+            # Extract usage and potentially other final metadata (status code from final response if available)
+            usage_and_metadata = _extract_response_details(
+                method_name, final_response_obj, is_stream_response=True
+            )
+            telemetry_payload.update(usage_and_metadata)
+            # If the stream errored, status_code_stream would be set. Otherwise, try to get from final response.
+            if status_code_stream == 200 and hasattr(final_response_obj, "status_code"):
+                status_code_stream = final_response_obj.status_code
+            elif hasattr(original_stream, "_response") and hasattr(
+                original_stream._response, "status_code"
+            ):  # Fallback for older stream objects
+                if status_code_stream == 200:
+                    status_code_stream = original_stream._response.status_code
+        else:
+            # This case means we couldn't get a final response object from the stream to extract usage.
+            # Token usage will be missing. Latency will still be recorded.
+            print(
+                f"WIRETAPP_SDK: WARNING - Could not retrieve final response object from stream for {method_name}. Token usage data may be missing.",
+                file=sys.stderr,
+            )
+
+        telemetry_payload["latency_ms"] = int(
+            (time.time() - stream_start_time_s) * 1000
+        )
+        telemetry_payload["status_code"] = (
+            status_code_stream  # This reflects stream processing status
+        )
+        if error_info_stream:
+            telemetry_payload["error_info"] = error_info_stream
+
+        _send_telemetry(telemetry_payload)
+
+
+async def _wrap_async_stream(
+    original_stream: AsyncIterator[Any],
+    telemetry_payload: Dict[str, Any],
+    method_name: str,
+) -> AsyncIterator[Any]:
+    """Wraps an asynchronous stream iterator to capture telemetry."""
+    stream_start_time_s = telemetry_payload["timestamp_client_call_utc"]
+    accumulator = _StreamAccumulator(method_name, _include_content)
+    error_info_stream: Optional[Dict[str, Any]] = None
+    status_code_stream: int = 200
+
+    try:
+        async for chunk in original_stream:
+            accumulator.process_chunk(chunk)
+            yield chunk
+    except openai.APIStatusError as e:
+        status_code_stream = e.status_code
+        error_info_stream = {
+            "error_type": type(e).__name__,
+            "error_message": str(_safe_getattr(e, "message", str(e))),
+            "error_code": _safe_getattr(e, "code"),
+            "error_param": _safe_getattr(e, "param"),
+        }
+        raise
+    except Exception as e:
+        status_code_stream = 500
+        error_info_stream = {"error_type": type(e).__name__, "error_message": str(e)}
+        raise
+    finally:
+        telemetry_payload.update(accumulator.get_accumulated_content_details())
+
+        final_response_obj = _safe_getattr(original_stream, "response")
+        if final_response_obj:
+            usage_and_metadata = _extract_response_details(
+                method_name, final_response_obj, is_stream_response=True
+            )
+            telemetry_payload.update(usage_and_metadata)
+            if status_code_stream == 200 and hasattr(final_response_obj, "status_code"):
+                status_code_stream = final_response_obj.status_code
+            elif hasattr(original_stream, "_response") and hasattr(
+                original_stream._response, "status_code"
+            ):
+                if status_code_stream == 200:
+                    status_code_stream = original_stream._response.status_code
+        else:
+            print(
+                f"WIRETAPP_SDK: WARNING - Could not retrieve final response object from async stream for {method_name}. Token usage data may be missing.",
+                file=sys.stderr,
+            )
+
+        telemetry_payload["latency_ms"] = int(
+            (time.time() - stream_start_time_s) * 1000
+        )
+        telemetry_payload["status_code"] = status_code_stream
+        if error_info_stream:
+            telemetry_payload["error_info"] = error_info_stream
+
+        _send_telemetry(telemetry_payload)
+
+
+def _create_wrapper(
+    original_func: Callable[..., Any], method_identifier: str
+) -> Callable[..., Any]:
+    """
+    Creates a synchronous wrapper for SDK v1.x. Handles regular and streaming calls.
+    """
+    global _app_name
+
+    @wraps(original_func)
+    def wrapper(self_instance: Any, *args: Any, **kwargs: Any) -> Any:
+        start_time_s = time.time()  # For non-streaming latency or base for streaming
+
+        telemetry_payload_base: Dict[str, Any] = {
+            "event_id": hashlib.sha256(os.urandom(32)).hexdigest(),
+            "app_name": _app_name,
+            "api_method": method_identifier,
+            "timestamp_client_call_utc": start_time_s,
+        }
+        telemetry_payload_base.update(_extract_call_details(method_identifier, kwargs))
+
+        if kwargs.get("stream") is True:
+            stream_iterator = original_func(self_instance, *args, **kwargs)
+            # Telemetry is sent by _wrap_sync_stream after stream is consumed
+            return _wrap_sync_stream(
+                stream_iterator, telemetry_payload_base, method_identifier
+            )
+        else:
+            response_obj: Any = None
+            error_info: Optional[Dict[str, Any]] = None
+            status_code: int = 0
+            try:
+                response_obj = original_func(self_instance, *args, **kwargs)
+                if (
+                    hasattr(self_instance, "_client")
+                    and hasattr(self_instance._client, "last_response")
+                    and self_instance._client.last_response
+                ):
+                    status_code = self_instance._client.last_response.status_code
+                else:
+                    status_code = 200
+                telemetry_payload_base.update(
+                    _extract_response_details(method_identifier, response_obj)
+                )
+            except openai.APIStatusError as e:
+                status_code = e.status_code
+                error_info = {
+                    "error_type": type(e).__name__,
+                    "error_message": str(_safe_getattr(e, "message", str(e))),
+                    "error_code": _safe_getattr(e, "code"),
+                    "error_param": _safe_getattr(e, "param"),
+                }
+                raise
+            except openai.APIError as e:
+                status_code = _safe_getattr(e, "status_code", 500)
+                error_info = {
+                    "error_type": type(e).__name__,
+                    "error_message": str(_safe_getattr(e, "message", str(e))),
+                    "error_code": _safe_getattr(e, "code"),
+                }
+                raise
+            except Exception as e:
+                status_code = 500
+                error_info = {"error_type": type(e).__name__, "error_message": str(e)}
+                raise
+            finally:
+                telemetry_payload_base["latency_ms"] = int(
+                    (time.time() - start_time_s) * 1000
+                )
+                telemetry_payload_base["status_code"] = status_code
+                if error_info:
+                    telemetry_payload_base["error_info"] = error_info
+                _send_telemetry(telemetry_payload_base)
+            return response_obj
+
+    return wrapper
+
+
+def _create_async_wrapper(original_func: Callable[..., Coroutine[Any, Any, Any]], method_identifier: str) -> Callable[..., Coroutine[Any, Any, Any]]:
+    """
+    Creates an asynchronous wrapper for SDK v1.x. Handles regular and streaming calls.
+    """
+    global _app_name
+
+    @wraps(original_func)
+    async def async_wrapper(self_instance: Any, *args: Any, **kwargs: Any) -> Any:
+        start_time_s = time.time()
+
+        telemetry_payload_base: Dict[str, Any] = {
+            "event_id": hashlib.sha256(os.urandom(32)).hexdigest(),
+            "app_name": _app_name,
+            "api_method": method_identifier,
+            "timestamp_client_call_utc": start_time_s,
+        }
+        telemetry_payload_base.update(_extract_call_details(method_identifier, kwargs))
+
+        if kwargs.get("stream") is True:
+            stream_iterator = await original_func(self_instance, *args, **kwargs)
+            # Telemetry is sent by _wrap_async_stream after stream is consumed
+            return _wrap_async_stream(
+                stream_iterator, telemetry_payload_base, method_identifier
+            )
+        else:
+            response_obj: Any = None
+            error_info: Optional[Dict[str, Any]] = None
+            status_code: int = 0
+            try:
+                response_obj = await original_func(self_instance, *args, **kwargs)
+                if (
+                    hasattr(self_instance, "_client")
+                    and hasattr(self_instance._client, "last_response")
+                    and self_instance._client.last_response
+                ):
+                    status_code = self_instance._client.last_response.status_code
+                else:
+                    status_code = 200
+                telemetry_payload_base.update(
+                    _extract_response_details(method_identifier, response_obj)
+                )
+            except openai.APIStatusError as e:
+                status_code = e.status_code
+                error_info = {
+                    "error_type": type(e).__name__,
+                    "error_message": str(_safe_getattr(e, "message", str(e))),
+                    "error_code": _safe_getattr(e, "code"),
+                    "error_param": _safe_getattr(e, "param"),
+                }
+                raise
+            except openai.APIError as e:
+                status_code = _safe_getattr(e, "status_code", 500)
+                error_info = {
+                    "error_type": type(e).__name__,
+                    "error_message": str(_safe_getattr(e, "message", str(e))),
+                    "error_code": _safe_getattr(e, "code"),
+                }
+                raise
+            except Exception as e:
+                status_code = 500
+                error_info = {"error_type": type(e).__name__, "error_message": str(e)}
+                raise
+            finally:
+                telemetry_payload_base["latency_ms"] = int(
+                    (time.time() - start_time_s) * 1000
+                )
+                telemetry_payload_base["status_code"] = status_code
+                if error_info:
+                    telemetry_payload_base["error_info"] = error_info
+                _send_telemetry(telemetry_payload_base)
+            return response_obj
+
+    return async_wrapper
+
+
+def monitor(openai_module: Any, app_name: str) -> None:
+    """
+    Applies monkey-patching to the provided OpenAI module's resource classes
+    to capture telemetry for SDK v1.x.
+
+    It patches methods on classes like:
+    - openai.resources.chat.Completions.create
+    - openai.resources.chat.AsyncCompletions.create (and other 'a'-prefixed async methods)
+    - openai.resources.embeddings.Embeddings.create
+    - openai.resources.embeddings.AsyncEmbeddings.create
+    - (Potentially) openai.resources.completions.Completions.create (legacy)
+
+    Args:
+        openai_module: The imported `openai` module.
+        app_name: A name for your application, used for segmenting metrics.
+    """
+    global _app_name, _original_methods, _wiretapp_endpoint, _include_content
+
+    _app_name = app_name
+    _wiretapp_endpoint = os.getenv("WIRETAPP_ENDPOINT", "http://localhost:8000/events")
+    _include_content = os.getenv("WIRETAPP_INCLUDE_CONTENT", "0") == "1"
+
+    print(
+        f"WIRETAPP_SDK: Initializing monitor for app '{_app_name}' (SDK v1.x mode). Endpoint: '{_wiretapp_endpoint}'. Include content: {_include_content}"
+    )
+
+    # (Telemetry Identifier, Module Path to Class, Class Name, Method Name, Wrapper Type ('sync'|'async'))
+    patch_config: list[Tuple[str, str, str, str, str]] = [
+        # Chat Completions
+        (
+            "ChatCompletions.create",
+            "openai.resources.chat.completions",
+            "Completions",
+            "create",
+            "sync",
+        ),
+        (
+            "AsyncChatCompletions.create",
+            "openai.resources.chat.completions",
+            "AsyncCompletions",
+            "create",
+            "async",
+        ),
+        # Embeddings
+        (
+            "Embeddings.create",
+            "openai.resources.embeddings",
+            "Embeddings",
+            "create",
+            "sync",
+        ),
+        (
+            "AsyncEmbeddings.create",
+            "openai.resources.embeddings",
+            "AsyncEmbeddings",
+            "create",
+            "async",
+        ),
+        # Legacy Completions (if still needed)
+        (
+            "Completions.create",
+            "openai.resources.completions",
+            "Completions",
+            "create",
+            "sync",
+        ),
+        (
+            "AsyncCompletions.create",
+            "openai.resources.completions",
+            "AsyncCompletions",
+            "create",
+            "async",
+        ),
+        # Add other methods like '.generate' if they exist and are desired.
+        # For example, some older or specific models might use different call patterns.
+    ]
+
+    for tele_id, mod_path_str, class_name, method_name, wrapper_type in patch_config:
+        try:
+            module_parts = mod_path_str.split(".")
+            current_mod_or_class = openai_module
+            for part in module_parts[1:]:
+                if not hasattr(current_mod_or_class, part):
+                    print(
+                        f"WIRETAPP_SDK: INFO - Path '{mod_path_str}' component '{part}' not found. Skipping {tele_id}."
+                    )
+                    raise AttributeError(
+                        f"Path component '{part}' not found in '{mod_path_str}'"
+                    )
+                current_mod_or_class = getattr(current_mod_or_class, part)
+
+            target_class: Optional[Type] = getattr(
+                current_mod_or_class, class_name, None
+            )
+
+            if target_class is None:
+                print(
+                    f"WIRETAPP_SDK: INFO - Class '{class_name}' not found in '{mod_path_str}'. Skipping {tele_id}. (This may be normal if the OpenAI feature is not used/installed)."
+                )
+                continue
+
+            if hasattr(target_class, method_name):
+                original_method = getattr(target_class, method_name)
+                full_method_path = f"{mod_path_str}.{class_name}.{method_name}"
+
+                if callable(original_method) and not hasattr(
+                    original_method, "__is_wiretapp_wrapped__"
+                ):
+                    if full_method_path not in _original_methods:
+                        _original_methods[full_method_path] = original_method
+
+                        wrapper_func_creator = (
+                            _create_wrapper
+                            if wrapper_type == "sync"
+                            else _create_async_wrapper
+                        )
+                        wrapped_method = wrapper_func_creator(original_method, tele_id)
+
+                        setattr(wrapped_method, "__is_wiretapp_wrapped__", True)
+                        setattr(target_class, method_name, wrapped_method)
+                        print(
+                            f"WIRETAPP_SDK: Patched {full_method_path} (Telemetry ID: {tele_id})"
+                        )
+                    else:
+                        print(
+                            f"WIRETAPP_SDK: INFO - {full_method_path} was already processed (original stored). Skipping re-patch."
+                        )
+                elif hasattr(original_method, "__is_wiretapp_wrapped__"):
+                    print(
+                        f"WIRETAPP_SDK: INFO - {full_method_path} is already wrapped. Skipping."
+                    )
+                else:
+                    print(
+                        f"WIRETAPP_SDK: WARNING - {full_method_path} is not callable or cannot be wrapped. Skipping."
+                    )
+            else:
+                # Method not found on the class. This can be normal (e.g., an async method on a sync-only class).
+                # print(f"WIRETAPP_SDK: INFO - Method '{method_name}' not found on {target_class.__name__} in {mod_path_str}. Skipping {tele_id}.")
+                pass
+
+        except AttributeError:
+            # This catches AttributeErrors from the path traversal or getattr(current_mod_or_class, class_name, None)
+            # The specific print for path component not found is handled above.
+            # If it's an AttributeError for class_name not found, the message is printed before 'continue'.
+            # So, this 'pass' here handles the raised AttributeError from path traversal to break the inner loop and move to the next config.
+            pass
+        except Exception as e:
+            print(
+                f"WIRETAPP_SDK: ERROR - Failed to process patch for {tele_id} due to an unexpected error: {e}",
+                file=sys.stderr,
+            )
+            # import traceback
+            # traceback.print_exc()
+
+    # Remove the old SDK < 1.0 patching logic as requested.
+    # The previous `patch_targets` and loop for `openai.ChatCompletion.create` are gone.
+    # Also, the note about SDK >= 1.0.0 needing a different strategy is now implemented.
