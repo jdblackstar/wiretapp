@@ -2,10 +2,8 @@ import openai
 import time
 import os
 import hashlib
-import json
-import sys  # For stderr
+import logging  # Added logging
 
-# import requests # Future: for sending data to collector
 from functools import wraps
 from typing import (
     Any,
@@ -24,6 +22,9 @@ _original_methods: Dict[str, Callable[..., Any]] = {}
 _app_name: str = "default_app"
 _wiretapp_endpoint: str = os.getenv("WIRETAPP_ENDPOINT", "http://localhost:8000/events")
 _include_content: bool = os.getenv("WIRETAPP_INCLUDE_CONTENT", "0") == "1"
+
+# Initialize logger
+logger = logging.getLogger(__name__)  # Added logger
 
 
 # Helper to access nested attributes safely
@@ -59,18 +60,22 @@ def _send_telemetry(data: Dict[str, Any]) -> None:
     Args:
         data: The dictionary of telemetry data to send.
     """
-    # In a real scenario, consider logging to stderr for errors or using a robust logging library
-    print(f"WIRETAPP_TELEMETRY: {json.dumps(data)}")
-    # Future implementation:
-    # try:
-    #     # Ensure requests is added to dependencies if/when this is uncommented
-    #     import requests
-    #     response = requests.post(_wiretapp_endpoint, json=data, timeout=5)
-    #     response.raise_for_status()
-    # except requests.RequestException as e:
-    #     print(f"Wiretapp Error: Failed to send telemetry - {e}", file=sys.stderr)
-    # except ImportError:
-    #     print("Wiretapp Error: 'requests' library is not installed. Cannot send telemetry.", file=sys.stderr)
+    try:
+        import requests
+
+        response = requests.post(_wiretapp_endpoint, json=data, timeout=5)
+        response.raise_for_status()
+        logger.debug(
+            f"Telemetry sent successfully to {_wiretapp_endpoint}"
+        )  # Changed from optional print to logger.debug
+    except requests.RequestException as e:
+        logger.error(
+            f"Failed to send telemetry to {_wiretapp_endpoint} - {e}"
+        )  # Changed from print to logger.error
+    except ImportError:
+        logger.error(
+            "'requests' library is not installed. Cannot send telemetry. Please add 'requests' to your project dependencies."
+        )  # Changed from print to logger.error
 
 
 def _extract_call_details(method_name: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -139,7 +144,7 @@ def _extract_response_details(
                     if hasattr(first_choice, "text"):
                         details["completion_text_full"] = first_choice.text
             except (AttributeError, IndexError):
-                pass  # Or log a warning
+                pass  # Or log a warning maybe
     return details
 
 
@@ -266,9 +271,8 @@ def _wrap_sync_stream(
         else:
             # This case means we couldn't get a final response object from the stream to extract usage.
             # Token usage will be missing. Latency will still be recorded.
-            print(
-                f"WIRETAPP_SDK: WARNING - Could not retrieve final response object from stream for {method_name}. Token usage data may be missing.",
-                file=sys.stderr,
+            logger.warning(
+                f"Could not retrieve final response object from stream for {method_name}. Token usage data may be missing."
             )
 
         telemetry_payload["latency_ms"] = int(
@@ -328,9 +332,8 @@ async def _wrap_async_stream(
                 if status_code_stream == 200:
                     status_code_stream = original_stream._response.status_code
         else:
-            print(
-                f"WIRETAPP_SDK: WARNING - Could not retrieve final response object from async stream for {method_name}. Token usage data may be missing.",
-                file=sys.stderr,
+            logger.warning(
+                f"Could not retrieve final response object from async stream for {method_name}. Token usage data may be missing."
             )
 
         telemetry_payload["latency_ms"] = int(
@@ -420,7 +423,9 @@ def _create_wrapper(
     return wrapper
 
 
-def _create_async_wrapper(original_func: Callable[..., Coroutine[Any, Any, Any]], method_identifier: str) -> Callable[..., Coroutine[Any, Any, Any]]:
+def _create_async_wrapper(
+    original_func: Callable[..., Coroutine[Any, Any, Any]], method_identifier: str
+) -> Callable[..., Coroutine[Any, Any, Any]]:
     """
     Creates an asynchronous wrapper for SDK v1.x. Handles regular and streaming calls.
     """
@@ -517,8 +522,8 @@ def monitor(openai_module: Any, app_name: str) -> None:
     _wiretapp_endpoint = os.getenv("WIRETAPP_ENDPOINT", "http://localhost:8000/events")
     _include_content = os.getenv("WIRETAPP_INCLUDE_CONTENT", "0") == "1"
 
-    print(
-        f"WIRETAPP_SDK: Initializing monitor for app '{_app_name}' (SDK v1.x mode). Endpoint: '{_wiretapp_endpoint}'. Include content: {_include_content}"
+    logger.info(
+        f"Initializing monitor for app '{_app_name}' (SDK v1.x mode). Endpoint: '{_wiretapp_endpoint}'. Include content: {_include_content}"
     )
 
     # (Telemetry Identifier, Module Path to Class, Class Name, Method Name, Wrapper Type ('sync'|'async'))
@@ -578,8 +583,8 @@ def monitor(openai_module: Any, app_name: str) -> None:
             current_mod_or_class = openai_module
             for part in module_parts[1:]:
                 if not hasattr(current_mod_or_class, part):
-                    print(
-                        f"WIRETAPP_SDK: INFO - Path '{mod_path_str}' component '{part}' not found. Skipping {tele_id}."
+                    logger.info(
+                        f"Path '{mod_path_str}' component '{part}' not found. Skipping {tele_id}."
                     )
                     raise AttributeError(
                         f"Path component '{part}' not found in '{mod_path_str}'"
@@ -591,8 +596,8 @@ def monitor(openai_module: Any, app_name: str) -> None:
             )
 
             if target_class is None:
-                print(
-                    f"WIRETAPP_SDK: INFO - Class '{class_name}' not found in '{mod_path_str}'. Skipping {tele_id}. (This may be normal if the OpenAI feature is not used/installed)."
+                logger.info(
+                    f"Class '{class_name}' not found in '{mod_path_str}'. Skipping {tele_id}. (This may be normal if the OpenAI feature is not used/installed)."
                 )
                 continue
 
@@ -615,20 +620,20 @@ def monitor(openai_module: Any, app_name: str) -> None:
 
                         setattr(wrapped_method, "__is_wiretapp_wrapped__", True)
                         setattr(target_class, method_name, wrapped_method)
-                        print(
-                            f"WIRETAPP_SDK: Patched {full_method_path} (Telemetry ID: {tele_id})"
+                        logger.info(
+                            f"Patched {full_method_path} (Telemetry ID: {tele_id})"
                         )
                     else:
-                        print(
-                            f"WIRETAPP_SDK: INFO - {full_method_path} was already processed (original stored). Skipping re-patch."
+                        logger.info(
+                            f"INFO - {full_method_path} was already processed (original stored). Skipping re-patch."
                         )
                 elif hasattr(original_method, "__is_wiretapp_wrapped__"):
-                    print(
-                        f"WIRETAPP_SDK: INFO - {full_method_path} is already wrapped. Skipping."
+                    logger.info(
+                        f"INFO - {full_method_path} is already wrapped. Skipping."
                     )
                 else:
-                    print(
-                        f"WIRETAPP_SDK: WARNING - {full_method_path} is not callable or cannot be wrapped. Skipping."
+                    logger.warning(
+                        f"WARNING - {full_method_path} is not callable or cannot be wrapped. Skipping."
                     )
             else:
                 # Method not found on the class. This can be normal (e.g., an async method on a sync-only class).
@@ -642,13 +647,7 @@ def monitor(openai_module: Any, app_name: str) -> None:
             # So, this 'pass' here handles the raised AttributeError from path traversal to break the inner loop and move to the next config.
             pass
         except Exception as e:
-            print(
-                f"WIRETAPP_SDK: ERROR - Failed to process patch for {tele_id} due to an unexpected error: {e}",
-                file=sys.stderr,
+            logger.error(
+                f"Failed to process patch for {tele_id} due to an unexpected error: {e}",
+                exc_info=True,
             )
-            # import traceback
-            # traceback.print_exc()
-
-    # Remove the old SDK < 1.0 patching logic as requested.
-    # The previous `patch_targets` and loop for `openai.ChatCompletion.create` are gone.
-    # Also, the note about SDK >= 1.0.0 needing a different strategy is now implemented.
