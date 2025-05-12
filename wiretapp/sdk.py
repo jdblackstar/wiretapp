@@ -1,24 +1,17 @@
-import openai
-import time
-import os
 import hashlib
 import logging
-
+import os
+import time
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from functools import wraps
 from typing import (
     Any,
-    Callable,
-    Dict,
-    Optional,
-    Tuple,
-    Type,
-    Coroutine,
-    Iterator,
-    AsyncIterator,
 )
 
+import openai
+
 # Module-level configuration and state
-_original_methods: Dict[str, Callable[..., Any]] = {}
+_original_methods: dict[str, Callable[..., Any]] = {}
 _app_name: str = "default_app"
 _wiretapp_endpoint: str = os.getenv("WIRETAPP_ENDPOINT", "http://localhost:8000/events")
 _include_content: bool = os.getenv("WIRETAPP_INCLUDE_CONTENT", "0") == "1"
@@ -37,7 +30,7 @@ def _safe_getattr(obj: Any, attrs: str, default: Any = None) -> Any:
     return obj
 
 
-def _hash_identifier(identifier: Optional[str]) -> Optional[str]:
+def _hash_identifier(identifier: str | None) -> str | None:
     """
     Hashes an identifier using SHA-256 if it's provided.
 
@@ -52,7 +45,7 @@ def _hash_identifier(identifier: Optional[str]) -> Optional[str]:
     return hashlib.sha256(identifier.encode("utf-8")).hexdigest()
 
 
-def _send_telemetry(data: Dict[str, Any]) -> None:
+def _send_telemetry(data: dict[str, Any]) -> None:
     """
     Sends telemetry data to the configured endpoint.
     For now, it prints the data. In the future, it will make an HTTP POST request.
@@ -78,11 +71,11 @@ def _send_telemetry(data: Dict[str, Any]) -> None:
         )  # Changed from print to logger.error
 
 
-def _extract_call_details(method_name: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_call_details(method_name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
     """
     Extracts common details from the OpenAI call arguments for SDK v1.x.
     """
-    details: Dict[str, Any] = {
+    details: dict[str, Any] = {
         "model_name": kwargs.get("model"),
         # For OpenAI SDK v1.x, 'user' is a valid parameter in chat/completions.create
         "user_id_hashed": _hash_identifier(kwargs.get("user")),
@@ -159,9 +152,9 @@ class _StreamAccumulator:
         self.include_content = include_content
         self.accumulated_content: list[str] = []
         self.full_completion_deltas: list[
-            Dict[str, Any]
+            dict[str, Any]
         ] = []  # For chat, if needed for structured reconstruction
-        self.role: Optional[str] = None
+        self.role: str | None = None
 
     def process_chunk(self, chunk: Any) -> None:
         """Processes a single chunk from an OpenAI stream."""
@@ -198,12 +191,12 @@ class _StreamAccumulator:
             # Chunk structure might vary or be empty
             pass
 
-    def get_accumulated_content_details(self) -> Dict[str, Any]:
+    def get_accumulated_content_details(self) -> dict[str, Any]:
         """Returns a dictionary with the accumulated content from the stream."""
         if not self.include_content or not self.accumulated_content:
             return {}
 
-        details: Dict[str, Any] = {}
+        details: dict[str, Any] = {}
         joined_content = "".join(self.accumulated_content)
 
         if "ChatCompletions" in self.method_name:
@@ -226,14 +219,14 @@ class _StreamAccumulator:
 
 
 def _wrap_sync_stream(
-    original_stream: Iterator[Any], telemetry_payload: Dict[str, Any], method_name: str
+    original_stream: Iterator[Any], telemetry_payload: dict[str, Any], method_name: str
 ) -> Iterator[Any]:
     """Wraps a synchronous stream iterator to capture telemetry."""
     stream_start_time_s = telemetry_payload[
         "timestamp_client_call_utc"
     ]  # Start time of the initial API call
     accumulator = _StreamAccumulator(method_name, _include_content)
-    error_info_stream: Optional[Dict[str, Any]] = None
+    error_info_stream: dict[str, Any] | None = None
     status_code_stream: int = 200  # Assume success unless error during stream
 
     try:
@@ -292,13 +285,13 @@ def _wrap_sync_stream(
 
 async def _wrap_async_stream(
     original_stream: AsyncIterator[Any],
-    telemetry_payload: Dict[str, Any],
+    telemetry_payload: dict[str, Any],
     method_name: str,
 ) -> AsyncIterator[Any]:
     """Wraps an asynchronous stream iterator to capture telemetry."""
     stream_start_time_s = telemetry_payload["timestamp_client_call_utc"]
     accumulator = _StreamAccumulator(method_name, _include_content)
-    error_info_stream: Optional[Dict[str, Any]] = None
+    error_info_stream: dict[str, Any] | None = None
     status_code_stream: int = 200
 
     try:
@@ -361,7 +354,7 @@ def _create_wrapper(
     def wrapper(self_instance: Any, *args: Any, **kwargs: Any) -> Any:
         start_time_s = time.time()  # For non-streaming latency or base for streaming
 
-        telemetry_payload_base: Dict[str, Any] = {
+        telemetry_payload_base: dict[str, Any] = {
             "event_id": hashlib.sha256(os.urandom(32)).hexdigest(),
             "app_name": _app_name,
             "api_method": method_identifier,
@@ -377,7 +370,7 @@ def _create_wrapper(
             )
         else:
             response_obj: Any = None
-            error_info: Optional[Dict[str, Any]] = None
+            error_info: dict[str, Any] | None = None
             status_code: int = 0
             try:
                 response_obj = original_func(self_instance, *args, **kwargs)
@@ -438,7 +431,7 @@ def _create_async_wrapper(
     async def async_wrapper(self_instance: Any, *args: Any, **kwargs: Any) -> Any:
         start_time_s = time.time()
 
-        telemetry_payload_base: Dict[str, Any] = {
+        telemetry_payload_base: dict[str, Any] = {
             "event_id": hashlib.sha256(os.urandom(32)).hexdigest(),
             "app_name": _app_name,
             "api_method": method_identifier,
@@ -454,7 +447,7 @@ def _create_async_wrapper(
             )
         else:
             response_obj: Any = None
-            error_info: Optional[Dict[str, Any]] = None
+            error_info: dict[str, Any] | None = None
             status_code: int = 0
             try:
                 response_obj = await original_func(self_instance, *args, **kwargs)
@@ -530,7 +523,7 @@ def monitor(openai_module: Any, app_name: str) -> None:
     )
 
     # (Telemetry Identifier, Module Path to Class, Class Name, Method Name, Wrapper Type ('sync'|'async'))
-    patch_config: list[Tuple[str, str, str, str, str]] = [
+    patch_config: list[tuple[str, str, str, str, str]] = [
         # Chat Completions
         (
             "ChatCompletions.create",
@@ -594,7 +587,7 @@ def monitor(openai_module: Any, app_name: str) -> None:
                     )
                 current_mod_or_class = getattr(current_mod_or_class, part)
 
-            target_class: Optional[Type] = getattr(
+            target_class: type | None = getattr(
                 current_mod_or_class, class_name, None
             )
 
@@ -621,7 +614,7 @@ def monitor(openai_module: Any, app_name: str) -> None:
                         )
                         wrapped_method = wrapper_func_creator(original_method, tele_id)
 
-                        setattr(wrapped_method, "__is_wiretapp_wrapped__", True)
+                        wrapped_method.__is_wiretapp_wrapped__ = True
                         setattr(target_class, method_name, wrapped_method)
                         logger.info(
                             f"Patched {full_method_path} (Telemetry ID: {tele_id})"
