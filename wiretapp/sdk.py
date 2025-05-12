@@ -3,6 +3,7 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import (
     Any,
@@ -23,6 +24,15 @@ _include_content: bool = os.getenv("WIRETAPP_INCLUDE_CONTENT", "0") == "1"
 # Initialize logger
 logger = logging.getLogger(__name__)  # Added logger
 
+@dataclass
+class Config:
+    """Global configuration for the SDK."""
+    app_name: str = "default_app"
+    wiretapp_endpoint: str = os.getenv("WIRETAPP_ENDPOINT", "http://localhost:8000/events")
+    include_content: bool = os.getenv("WIRETAPP_INCLUDE_CONTENT", "0") == "1"
+    original_methods: dict[str, Callable[..., Any]] = field(default_factory=dict)
+
+_config = Config()
 
 # Helper to access nested attributes safely
 def _safe_getattr(obj: Any, attrs: str, default: Any = None) -> Any:
@@ -60,14 +70,14 @@ def _send_telemetry(data: dict[str, Any]) -> None:
     try:
         import requests
 
-        response = requests.post(_wiretapp_endpoint, json=data, timeout=5)
+        response = requests.post(_config.wiretapp_endpoint, json=data, timeout=5)
         response.raise_for_status()
         logger.debug(
-            f"Telemetry sent successfully to {_wiretapp_endpoint}"
+            f"Telemetry sent successfully to {_config.wiretapp_endpoint}"
         )  # Changed from optional print to logger.debug
     except requests.RequestException as e:
         logger.error(
-            f"Failed to send telemetry to {_wiretapp_endpoint} - {e}"
+            f"Failed to send telemetry to {_config.wiretapp_endpoint} - {e}"
         )  # Changed from print to logger.error
     except ImportError:
         logger.error(
@@ -87,7 +97,7 @@ def _extract_call_details(method_name: str, kwargs: dict[str, Any]) -> dict[str,
         "session_id_hashed": _hash_identifier(kwargs.get("session_id")),
     }
 
-    if _include_content:
+    if _config.include_content:
         # Method names like "ChatCompletions.create", "Embeddings.create"
         if "ChatCompletions" in method_name:  # Covers sync and async
             details["prompt_messages"] = kwargs.get("messages")
@@ -143,7 +153,7 @@ def _extract_response_details(
 ) -> dict[str, Any]:
     """Extracts details from the OpenAI API response for SDK v1.x."""
     details = _extract_usage_details(response)
-    if not is_stream_response and _include_content:
+    if not is_stream_response and _config.include_content:
         details.update(_extract_completion_details(method_name, response))
     return details
 
@@ -229,7 +239,7 @@ def _wrap_sync_stream(
     stream_start_time_s = telemetry_payload[
         "timestamp_client_call_utc"
     ]  # Start time of the initial API call
-    accumulator = _StreamAccumulator(method_name, _include_content)
+    accumulator = _StreamAccumulator(method_name, _config.include_content)
     error_info_stream: dict[str, Any] | None = None
     status_code_stream: int = HTTP_OK  # Assume success unless error during stream
 
@@ -294,7 +304,7 @@ async def _wrap_async_stream(
 ) -> AsyncIterator[Any]:
     """Wraps an asynchronous stream iterator to capture telemetry."""
     stream_start_time_s = telemetry_payload["timestamp_client_call_utc"]
-    accumulator = _StreamAccumulator(method_name, _include_content)
+    accumulator = _StreamAccumulator(method_name, _config.include_content)
     error_info_stream: dict[str, Any] | None = None
     status_code_stream: int = HTTP_OK
 
@@ -352,15 +362,13 @@ def _create_wrapper(
     """
     Creates a synchronous wrapper for SDK v1.x. Handles regular and streaming calls.
     """
-    global _app_name
-
     @wraps(original_func)
     def wrapper(self_instance: Any, *args: Any, **kwargs: Any) -> Any:
         start_time_s = time.time()  # For non-streaming latency or base for streaming
 
         telemetry_payload_base: dict[str, Any] = {
             "event_id": hashlib.sha256(os.urandom(32)).hexdigest(),
-            "app_name": _app_name,
+            "app_name": _config.app_name,
             "api_method": method_identifier,
             "timestamp_client_call_utc": start_time_s,
         }
@@ -429,15 +437,13 @@ def _create_async_wrapper(
     """
     Creates an asynchronous wrapper for SDK v1.x. Handles regular and streaming calls.
     """
-    global _app_name
-
     @wraps(original_func)
     async def async_wrapper(self_instance: Any, *args: Any, **kwargs: Any) -> Any:
         start_time_s = time.time()
 
         telemetry_payload_base: dict[str, Any] = {
             "event_id": hashlib.sha256(os.urandom(32)).hexdigest(),
-            "app_name": _app_name,
+            "app_name": _config.app_name,
             "api_method": method_identifier,
             "timestamp_client_call_utc": start_time_s,
         }
@@ -500,154 +506,69 @@ def _create_async_wrapper(
     return async_wrapper
 
 
+@dataclass
+class PatchConfig:
+    """Configuration for patching an OpenAI module method."""
+    tele_id: str
+    mod_path_str: str
+    class_name: str
+    method_name: str
+    wrapper_type: str
+
+def _apply_patch(openai_module: Any, config: PatchConfig) -> None:
+    """Apply a single patch to an OpenAI module method."""
+    try:
+        module_parts = config.mod_path_str.split(".")
+        current_mod_or_class = openai_module
+        for part in module_parts[1:]:
+            if not hasattr(current_mod_or_class, part):
+                logger.info(f"Path '{config.mod_path_str}' component '{part}' not found. Skipping {config.tele_id}.")
+                return
+            current_mod_or_class = getattr(current_mod_or_class, part)
+
+        target_class = getattr(current_mod_or_class, config.class_name, None)
+        if target_class is None:
+            logger.info(f"Class '{config.class_name}' not found in '{config.mod_path_str}'. Skipping {config.tele_id}.")
+            return
+
+        if not hasattr(target_class, config.method_name):
+            return
+
+        original_method = getattr(target_class, config.method_name)
+        full_method_path = f"{config.mod_path_str}.{config.class_name}.{config.method_name}"
+
+        if not callable(original_method) or hasattr(original_method, "__is_wiretapp_wrapped__"):
+            return
+
+        if full_method_path not in _config.original_methods:
+            _config.original_methods[full_method_path] = original_method
+            wrapper_func_creator = _create_wrapper if config.wrapper_type == "sync" else _create_async_wrapper
+            wrapped_method = wrapper_func_creator(original_method, config.tele_id)
+            wrapped_method.__is_wiretapp_wrapped__ = True
+            setattr(target_class, config.method_name, wrapped_method)
+            logger.info(f"Patched {full_method_path} (Telemetry ID: {config.tele_id})")
+        else:
+            logger.info(f"INFO - {full_method_path} was already processed (original stored). Skipping re-patch.")
+
+    except Exception as e:
+        logger.error(f"Failed to process patch for {config.tele_id} due to an unexpected error: {e}", exc_info=True)
+
 def monitor(openai_module: Any, app_name: str) -> None:
-    """
-    Applies monkey-patching to the provided OpenAI module's resource classes
-    to capture telemetry for SDK v1.x.
+    """Applies monkey-patching to the provided OpenAI module's resource classes."""
+    _config.app_name = app_name
+    _config.wiretapp_endpoint = os.getenv("WIRETAPP_ENDPOINT", "http://localhost:8000/events")
+    _config.include_content = os.getenv("WIRETAPP_INCLUDE_CONTENT", "0") == "1"
 
-    It patches methods on classes like:
-    - openai.resources.chat.Completions.create
-    - openai.resources.chat.AsyncCompletions.create (and other 'a'-prefixed async methods)
-    - openai.resources.embeddings.Embeddings.create
-    - openai.resources.embeddings.AsyncEmbeddings.create
-    - (Potentially) openai.resources.completions.Completions.create (legacy)
+    logger.info(f"Initializing monitor for app '{_config.app_name}' (SDK v1.x mode). Endpoint: '{_config.wiretapp_endpoint}'. Include content: {_config.include_content}")
 
-    Args:
-        openai_module: The imported `openai` module.
-        app_name: A name for your application, used for segmenting metrics.
-    """
-    global _app_name, _original_methods, _wiretapp_endpoint, _include_content
-
-    _app_name = app_name
-    _wiretapp_endpoint = os.getenv("WIRETAPP_ENDPOINT", "http://localhost:8000/events")
-    _include_content = os.getenv("WIRETAPP_INCLUDE_CONTENT", "0") == "1"
-
-    logger.info(
-        f"Initializing monitor for app '{_app_name}' (SDK v1.x mode). Endpoint: '{_wiretapp_endpoint}'. Include content: {_include_content}"
-    )
-
-    # (Telemetry Identifier, Module Path to Class, Class Name, Method Name, Wrapper Type ('sync'|'async'))
-    patch_config: list[tuple[str, str, str, str, str]] = [
-        # Chat Completions
-        (
-            "ChatCompletions.create",
-            "openai.resources.chat.completions",
-            "Completions",
-            "create",
-            "sync",
-        ),
-        (
-            "AsyncChatCompletions.create",
-            "openai.resources.chat.completions",
-            "AsyncCompletions",
-            "create",
-            "async",
-        ),
-        # Embeddings
-        (
-            "Embeddings.create",
-            "openai.resources.embeddings",
-            "Embeddings",
-            "create",
-            "sync",
-        ),
-        (
-            "AsyncEmbeddings.create",
-            "openai.resources.embeddings",
-            "AsyncEmbeddings",
-            "create",
-            "async",
-        ),
-        # Legacy Completions (if still needed)
-        (
-            "Completions.create",
-            "openai.resources.completions",
-            "Completions",
-            "create",
-            "sync",
-        ),
-        (
-            "AsyncCompletions.create",
-            "openai.resources.completions",
-            "AsyncCompletions",
-            "create",
-            "async",
-        ),
-        # Add other methods like '.generate' if they exist and are desired.
-        # For example, some older or specific models might use different call patterns.
+    patch_configs = [
+        PatchConfig("ChatCompletions.create", "openai.resources.chat.completions", "Completions", "create", "sync"),
+        PatchConfig("AsyncChatCompletions.create", "openai.resources.chat.completions", "AsyncCompletions", "create", "async"),
+        PatchConfig("Embeddings.create", "openai.resources.embeddings", "Embeddings", "create", "sync"),
+        PatchConfig("AsyncEmbeddings.create", "openai.resources.embeddings", "AsyncEmbeddings", "create", "async"),
+        PatchConfig("Completions.create", "openai.resources.completions", "Completions", "create", "sync"),
+        PatchConfig("AsyncCompletions.create", "openai.resources.completions", "AsyncCompletions", "create", "async"),
     ]
 
-    for tele_id, mod_path_str, class_name, method_name, wrapper_type in patch_config:
-        try:
-            module_parts = mod_path_str.split(".")
-            current_mod_or_class = openai_module
-            for part in module_parts[1:]:
-                if not hasattr(current_mod_or_class, part):
-                    logger.info(
-                        f"Path '{mod_path_str}' component '{part}' not found. Skipping {tele_id}."
-                    )
-                    raise AttributeError(
-                        f"Path component '{part}' not found in '{mod_path_str}'"
-                    )
-                current_mod_or_class = getattr(current_mod_or_class, part)
-
-            target_class: type | None = getattr(
-                current_mod_or_class, class_name, None
-            )
-
-            if target_class is None:
-                logger.info(
-                    f"Class '{class_name}' not found in '{mod_path_str}'. Skipping {tele_id}. (This may be normal if the OpenAI feature is not used/installed)."
-                )
-                continue
-
-            if hasattr(target_class, method_name):
-                original_method = getattr(target_class, method_name)
-                full_method_path = f"{mod_path_str}.{class_name}.{method_name}"
-
-                if callable(original_method) and not hasattr(
-                    original_method, "__is_wiretapp_wrapped__"
-                ):
-                    if full_method_path not in _original_methods:
-                        _original_methods[full_method_path] = original_method
-
-                        wrapper_func_creator = (
-                            _create_wrapper
-                            if wrapper_type == "sync"
-                            else _create_async_wrapper
-                        )
-                        wrapped_method = wrapper_func_creator(original_method, tele_id)
-
-                        wrapped_method.__is_wiretapp_wrapped__ = True
-                        setattr(target_class, method_name, wrapped_method)
-                        logger.info(
-                            f"Patched {full_method_path} (Telemetry ID: {tele_id})"
-                        )
-                    else:
-                        logger.info(
-                            f"INFO - {full_method_path} was already processed (original stored). Skipping re-patch."
-                        )
-                elif hasattr(original_method, "__is_wiretapp_wrapped__"):
-                    logger.info(
-                        f"INFO - {full_method_path} is already wrapped. Skipping."
-                    )
-                else:
-                    logger.warning(
-                        f"WARNING - {full_method_path} is not callable or cannot be wrapped. Skipping."
-                    )
-            else:
-                # Method not found on the class. This can be normal (e.g., an async method on a sync-only class).
-                # print(f"WIRETAPP_SDK: INFO - Method '{method_name}' not found on {target_class.__name__} in {mod_path_str}. Skipping {tele_id}.")
-                pass
-
-        except AttributeError:
-            # This catches AttributeErrors from the path traversal or getattr(current_mod_or_class, class_name, None)
-            # The specific print for path component not found is handled above.
-            # If it's an AttributeError for class_name not found, the message is printed before 'continue'.
-            # So, this 'pass' here handles the raised AttributeError from path traversal to break the inner loop and move to the next config.
-            pass
-        except Exception as e:
-            logger.error(
-                f"Failed to process patch for {tele_id} due to an unexpected error: {e}",
-                exc_info=True,
-            )
+    for config in patch_configs:
+        _apply_patch(openai_module, config)
