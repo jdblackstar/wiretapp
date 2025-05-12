@@ -96,7 +96,7 @@ Wiretapp is built with privacy as a core principle:
 The Wiretapp SDK can be configured through parameters to the `monitor()` function and environment variables:
 
 *   **`app_name` (parameter):** As shown in the initialization example, pass this directly to `wiretapp.monitor()`.
-*   **`WIRETAPP_ENDPOINT` (Environment Variable):** This crucial variable tells the SDK the network address of your Wiretapp collector service. Ensure this is set correctly in your application's environment. For example: `WIRETAPP_ENDPOINT=http://localhost:8000/events`. Refer to the main `## Configuration` section of this README for more on setting up your `.env` file.
+*   **`WIRETAPP_ENDPOINT` (Environment Variable):** This crucial variable tells the SDK the network address of your Wiretapp collector service's `/events` endpoint. Ensure this is set correctly in your application's environment. For example: `WIRETAPP_ENDPOINT=http://localhost:8000/events`. Refer to the main `## Configuration` section of this README for more on setting up your `.env` file.
 *   **`WIRETAPP_INCLUDE_CONTENT=1` (Environment Variable):** To record the full text of prompts and completions, set this environment variable to `1`. Before enabling this, carefully consider the privacy implications and ensure compliance with any applicable regulations.
     *   Example: `export WIRETAPP_INCLUDE_CONTENT=1` (in your shell) or set it in your application's environment.
 *   **Other Configurations:** The SDK might support additional environment variables for finer control (e.g., connection timeouts, custom identifier hashing). Please refer to the SDK's specific documentation or source code if you need more advanced customization.
@@ -123,7 +123,7 @@ Python SDK that monkey‑patches OpenAI calls and emits telemetry
 
 collector/
 
-FastAPI ingestion service that validates and stores events (e.g., to Kafka)
+FastAPI ingestion service that receives telemetry via an HTTP endpoint (e.g. `/events`). It validates events using Pydantic (acting as schema validation) and publishes them to a Kafka topic (e.g., `KAFKA_VALIDATED_EVENTS_TOPIC`). The collector features resilient Kafka integration with automated retries and provides a `/health` endpoint.
 
 spark_jobs/
 
@@ -162,10 +162,35 @@ All metrics refresh in under five minutes on commodity hardware.
 
 ## Configuration
 
-Wiretapp uses environment variables for secrets and hostnames. Copy .env.example to .env and tweak:
+Wiretapp uses environment variables for secrets and hostnames. Copy `.env.example` to `.env` and tweak.
+
+**SDK Configuration (.env):**
 
 ```
+# Tells the Wiretapp SDK where to send telemetry data
 WIRETAPP_ENDPOINT=http://localhost:8000/events
+
+# Optional: Set to 1 to include raw prompt/completion content (consider privacy implications)
+# WIRETAPP_INCLUDE_CONTENT=0
+```
+
+**Collector Service Configuration (.env):**
+
+These variables configure the Collector service itself. Defaults are often suitable for local Docker-based setups.
+
+```
+# Kafka settings for the Collector
+KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+KAFKA_VALIDATED_EVENTS_TOPIC=validated-telemetry-events
+# KAFKA_RAW_EVENTS_TOPIC=raw-telemetry-events # If using an alternative raw ingestion path
+
+# Collector application host and port (typically managed by Docker/Uvicorn)
+# APP_HOST=0.0.0.0
+# APP_PORT=8000
+```
+
+**Data Pipeline Configuration (.env) (for downstream components):**
+```
 MINIO_ACCESS_KEY=minio
 MINIO_SECRET_KEY=minio123
 ```
@@ -174,7 +199,7 @@ MINIO_SECRET_KEY=minio123
 
 - User and session IDs are SHA‑256 hashed client‑side before transport.
 - Raw prompts and completions are redacted unless `WIRETAPP_INCLUDE_CONTENT=1` is set.
-- Collector enforces JSON Schema validation and size limits.
+- Collector enforces Pydantic-based schema validation on incoming data and is designed to allow for request size limit enforcement.
 
 ## Roadmap
 - TBD
