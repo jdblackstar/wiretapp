@@ -5,10 +5,45 @@ description = "a tool to get model telemetry from any OpenAI-like API during cha
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "kafka-python>=2.2.6",
     "openai>=1.77.0",
+    "requests>=2.25.0",
     "pydantic>=2.11.4",
     "python-dotenv>=1.1.0",
-    "ruff>=0.11.8",
-    "requests>=2.25.0",
 ]
+
+[project.optional-dependencies]
+# Collector-specific runtime dependencies
+collector = [
+    "fastapi>=0.100,<0.112",
+    "pydantic>=2.0,<3.0",
+    "pydantic-settings>=2.0,<3.0",
+    "kafka-python>=2.0,<3.0",
+    "uvicorn[standard]>=0.20,<0.30"
+]
+
+# Development dependencies
+dev = [
+    "ruff>=0.11.8",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+select = ["E", "F", "I", "N", "W", "B", "UP", "PL", "RUF"]
+ignore = ["E501"]  # Line length violations
+
+[tool.ruff.isort]
+known-first-party = ["wiretapp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "--cov=wiretapp --cov-report=term-missing"
