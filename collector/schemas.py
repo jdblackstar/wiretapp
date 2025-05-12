@@ -1,6 +1,7 @@
-from pydantic import BaseModel
-from typing import Dict, Any, Optional
 from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel
 
 
 class TelemetryEvent(BaseModel):
@@ -8,7 +9,7 @@ class TelemetryEvent(BaseModel):
     timestamp: datetime
     app_name: str
     event_type: str  # e.g., 'openai_call', 'user_login', etc.
-    session_id: Optional[str] = None  # Hashed
-    user_id: Optional[str] = None  # Hashed
+    session_id: str | None = None  # Hashed
+    user_id: str | None = None  # Hashed
     # We can make the payload more specific later, or keep it flexible
-    payload: Dict[str, Any]
+    payload: dict[str, Any]
