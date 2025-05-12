@@ -103,16 +103,9 @@ def _extract_call_details(method_name: str, kwargs: Dict[str, Any]) -> Dict[str,
     return details
 
 
-def _extract_response_details(
-    method_name: str, response: Any, is_stream_response: bool = False
-) -> Dict[str, Any]:
-    """
-    Extracts details from the OpenAI API response for SDK v1.x.
-    For streams, `response` is the final response object after stream consumption (e.g., stream.response).
-    """
-    details: Dict[str, Any] = {}
-
-    # Usage is the primary thing to get from the final stream response or non-stream response
+def _extract_usage_details(response: Any) -> dict[str, Any]:
+    """Extract usage details from response object."""
+    details: dict[str, Any] = {}
     if hasattr(response, "usage") and response.usage:
         if hasattr(response.usage, "prompt_tokens"):
             details["token_usage_prompt"] = response.usage.prompt_tokens
@@ -120,31 +113,41 @@ def _extract_response_details(
             details["token_usage_completion"] = response.usage.completion_tokens
         if hasattr(response.usage, "total_tokens"):
             details["token_usage_total"] = response.usage.total_tokens
+    return details
 
-    # For non-streaming, and if content is included, extract full completion messages/text.
-    # For streaming, this part is handled by _StreamAccumulator for content.
+
+def _extract_completion_details(method_name: str, response: Any) -> dict[str, Any]:
+    """Extract completion details from response object."""
+    details: dict[str, Any] = {}
+    if not hasattr(response, "choices") or not response.choices:
+        return details
+    try:
+        first_choice = response.choices[0]
+        if "ChatCompletions" in method_name:
+            if hasattr(first_choice, "message") and first_choice.message:
+                details["completion_message_full"] = (
+                    first_choice.message.model_dump()
+                    if hasattr(first_choice.message, "model_dump")
+                    else {
+                        "role": _safe_getattr(first_choice.message, "role"),
+                        "content": _safe_getattr(first_choice.message, "content"),
+                    }
+                )
+        elif "Completions" in method_name and "Chat" not in method_name:
+            if hasattr(first_choice, "text"):
+                details["completion_text_full"] = first_choice.text
+    except (AttributeError, IndexError):
+        pass
+    return details
+
+
+def _extract_response_details(
+    method_name: str, response: Any, is_stream_response: bool = False
+) -> dict[str, Any]:
+    """Extracts details from the OpenAI API response for SDK v1.x."""
+    details = _extract_usage_details(response)
     if not is_stream_response and _include_content:
-        if hasattr(response, "choices") and response.choices:
-            try:
-                first_choice = response.choices[0]
-                if "ChatCompletions" in method_name:
-                    if hasattr(first_choice, "message") and first_choice.message:
-                        if hasattr(first_choice.message, "model_dump"):
-                            details["completion_message_full"] = (
-                                first_choice.message.model_dump()
-                            )
-                        else:
-                            details["completion_message_full"] = {
-                                "role": _safe_getattr(first_choice.message, "role"),
-                                "content": _safe_getattr(
-                                    first_choice.message, "content"
-                                ),
-                            }
-                elif "Completions" in method_name and "Chat" not in method_name:
-                    if hasattr(first_choice, "text"):
-                        details["completion_text_full"] = first_choice.text
-            except (AttributeError, IndexError):
-                pass  # Or log a warning maybe
+        details.update(_extract_completion_details(method_name, response))
     return details
 
 
