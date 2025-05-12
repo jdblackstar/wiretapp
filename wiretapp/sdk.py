@@ -10,6 +10,10 @@ from typing import (
 
 import openai
 
+# Constants
+HTTP_OK = 200
+HTTP_INTERNAL_ERROR = 500
+
 # Module-level configuration and state
 _original_methods: dict[str, Callable[..., Any]] = {}
 _app_name: str = "default_app"
@@ -227,7 +231,7 @@ def _wrap_sync_stream(
     ]  # Start time of the initial API call
     accumulator = _StreamAccumulator(method_name, _include_content)
     error_info_stream: dict[str, Any] | None = None
-    status_code_stream: int = 200  # Assume success unless error during stream
+    status_code_stream: int = HTTP_OK  # Assume success unless error during stream
 
     try:
         for chunk in original_stream:
@@ -243,7 +247,7 @@ def _wrap_sync_stream(
         }
         raise  # Re-raise to propagate to user
     except Exception as e:
-        status_code_stream = 500
+        status_code_stream = HTTP_INTERNAL_ERROR
         error_info_stream = {"error_type": type(e).__name__, "error_message": str(e)}
         raise  # Re-raise
     finally:
@@ -257,12 +261,12 @@ def _wrap_sync_stream(
             )
             telemetry_payload.update(usage_and_metadata)
             # If the stream errored, status_code_stream would be set. Otherwise, try to get from final response.
-            if status_code_stream == 200 and hasattr(final_response_obj, "status_code"):
+            if status_code_stream == HTTP_OK and hasattr(final_response_obj, "status_code"):
                 status_code_stream = final_response_obj.status_code
             elif hasattr(original_stream, "_response") and hasattr(
                 original_stream._response, "status_code"
             ):  # Fallback for older stream objects
-                if status_code_stream == 200:
+                if status_code_stream == HTTP_OK:
                     status_code_stream = original_stream._response.status_code
         else:
             # This case means we couldn't get a final response object from the stream to extract usage.
@@ -292,7 +296,7 @@ async def _wrap_async_stream(
     stream_start_time_s = telemetry_payload["timestamp_client_call_utc"]
     accumulator = _StreamAccumulator(method_name, _include_content)
     error_info_stream: dict[str, Any] | None = None
-    status_code_stream: int = 200
+    status_code_stream: int = HTTP_OK
 
     try:
         async for chunk in original_stream:
@@ -308,7 +312,7 @@ async def _wrap_async_stream(
         }
         raise
     except Exception as e:
-        status_code_stream = 500
+        status_code_stream = HTTP_INTERNAL_ERROR
         error_info_stream = {"error_type": type(e).__name__, "error_message": str(e)}
         raise
     finally:
@@ -320,12 +324,12 @@ async def _wrap_async_stream(
                 method_name, final_response_obj, is_stream_response=True
             )
             telemetry_payload.update(usage_and_metadata)
-            if status_code_stream == 200 and hasattr(final_response_obj, "status_code"):
+            if status_code_stream == HTTP_OK and hasattr(final_response_obj, "status_code"):
                 status_code_stream = final_response_obj.status_code
             elif hasattr(original_stream, "_response") and hasattr(
                 original_stream._response, "status_code"
             ):
-                if status_code_stream == 200:
+                if status_code_stream == HTTP_OK:
                     status_code_stream = original_stream._response.status_code
         else:
             logger.warning(
@@ -381,7 +385,7 @@ def _create_wrapper(
                 ):
                     status_code = self_instance._client.last_response.status_code
                 else:
-                    status_code = 200
+                    status_code = HTTP_OK
                 telemetry_payload_base.update(
                     _extract_response_details(method_identifier, response_obj)
                 )
@@ -395,7 +399,7 @@ def _create_wrapper(
                 }
                 raise
             except openai.APIError as e:
-                status_code = _safe_getattr(e, "status_code", 500)
+                status_code = _safe_getattr(e, "status_code", HTTP_INTERNAL_ERROR)
                 error_info = {
                     "error_type": type(e).__name__,
                     "error_message": str(_safe_getattr(e, "message", str(e))),
@@ -403,7 +407,7 @@ def _create_wrapper(
                 }
                 raise
             except Exception as e:
-                status_code = 500
+                status_code = HTTP_INTERNAL_ERROR
                 error_info = {"error_type": type(e).__name__, "error_message": str(e)}
                 raise
             finally:
@@ -458,7 +462,7 @@ def _create_async_wrapper(
                 ):
                     status_code = self_instance._client.last_response.status_code
                 else:
-                    status_code = 200
+                    status_code = HTTP_OK
                 telemetry_payload_base.update(
                     _extract_response_details(method_identifier, response_obj)
                 )
@@ -472,7 +476,7 @@ def _create_async_wrapper(
                 }
                 raise
             except openai.APIError as e:
-                status_code = _safe_getattr(e, "status_code", 500)
+                status_code = _safe_getattr(e, "status_code", HTTP_INTERNAL_ERROR)
                 error_info = {
                     "error_type": type(e).__name__,
                     "error_message": str(_safe_getattr(e, "message", str(e))),
@@ -480,7 +484,7 @@ def _create_async_wrapper(
                 }
                 raise
             except Exception as e:
-                status_code = 500
+                status_code = HTTP_INTERNAL_ERROR
                 error_info = {"error_type": type(e).__name__, "error_message": str(e)}
                 raise
             finally:
